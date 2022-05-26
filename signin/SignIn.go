@@ -25,15 +25,17 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/datastore"
+	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	"github.com/golang-jwt/jwt"
 	"github.com/google/uuid"
+	ua "github.com/mileusna/useragent"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/iterator"
+	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
-
-// secretmanager "cloud.google.com/go/secretmanager/apiv1"
-// secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 
 var projectID string
 var datastoreClient *datastore.Client
@@ -51,6 +53,14 @@ type UserDto struct {
 	Name     string `json:"name"`
 	Username string `json:"username"`
 	Picture  string `json:"picture"`
+}
+
+type TokenResponse struct {
+	AccessToken  string   `json:"access_token"`
+	Type         string   `json:"type"`
+	ExpiresIn    uint     `json:"expires_in"`
+	RefreshToken string   `json:"refresh_token"`
+	UserData     *UserDto `json:"user"`
 }
 
 var errNotFound = errors.New("data not found in database")
@@ -165,8 +175,8 @@ func sendMethodNotAllowedMsg(e string, w *http.ResponseWriter) {
 }
 
 func sendMsg(payload string, status int, w *http.ResponseWriter) {
-	(*w).WriteHeader(status)
 	(*w).Header().Set("Content-Type", "application/json; charset=utf-8")
+	(*w).WriteHeader(status)
 	(*w).Write([]byte(payload))
 }
 
@@ -212,6 +222,81 @@ func createNewUserFromGoogleClaims(ctx *context.Context, u *User, claims map[str
 		return err
 	}
 	return nil
+}
+
+func getPrivateJwtSecret(ctx *context.Context) ([]byte, error) {
+	secretClient, err := secretmanager.NewClient(*ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer secretClient.Close()
+
+	privKeyReq := &secretmanagerpb.AccessSecretVersionRequest{
+		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, "jwt-priv-key"),
+	}
+	privKeyResp, err := secretClient.AccessSecretVersion(*ctx, privKeyReq)
+	if err != nil {
+		return nil, err
+	}
+
+	return privKeyResp.Payload.Data, nil
+}
+
+func generateToken(ctx *context.Context, user *User, req *http.Request) (TokenResponse, error) {
+	refreshExpires := 15768000 // 6 months
+	now := time.Now().UTC()
+
+	var tokenResponse TokenResponse
+	privateKeyPem, err := getPrivateJwtSecret(ctx)
+	if err != nil {
+		return tokenResponse, err
+	}
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyPem)
+	if err != nil {
+		return tokenResponse, err
+	}
+
+	userAgent := ua.Parse(req.Header.Get("User-Agent"))
+
+	var refreshToken RefreshToken
+	refreshToken.ClientName = userAgent.Name
+	refreshToken.Device = userAgent.Device
+	refreshToken.Os = userAgent.OS
+
+	refreshToken.ExpiresAt = time.Now().UTC().Add(time.Second * time.Duration(refreshExpires))
+	refreshToken.UserId = user.Id.Name
+	err = refreshToken.Create(ctx, datastoreClient)
+	if err != nil {
+		return tokenResponse, err
+	}
+
+	type RefreshClaims struct {
+		Type string `json:"typ,omitempty"`
+		jwt.StandardClaims
+	}
+	refreshClaims := &RefreshClaims{
+		"refresh_token",
+		jwt.StandardClaims{
+			Id:       refreshToken.Id.Name,
+			Subject:  refreshToken.UserId,
+			Issuer:   "repair-shop-management-authorizer",
+			Audience: "repair-shop-management-server",
+			IssuedAt: now.Unix(),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS512, refreshClaims)
+	signedRefreshToken, err := token.SignedString(privateKey)
+	if err != nil {
+		return tokenResponse, err
+	}
+
+	tokenResponse.AccessToken = ""
+	tokenResponse.ExpiresIn = 0
+	tokenResponse.Type = "Bearer"
+	tokenResponse.UserData = user.Dto()
+	tokenResponse.RefreshToken = signedRefreshToken
+	return tokenResponse, nil
 }
 
 func SignIn(w http.ResponseWriter, r *http.Request) {
@@ -260,30 +345,18 @@ func SignIn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		fmt.Fprintf(w, "%v\n%v", user.Name, user.Username)
+		tokenResponse, err := generateToken(&ctx, &user, r)
+		if err != nil {
+			sendErrorMsg("Failed to generate token.", err.Error(), &w)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(tokenResponse)
 
 	default:
 		sendErrorMsg("The provider is not registered in our system.", "", &w)
 		return
 	}
 
-	// projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
-	// secretClient, err := secretmanager.NewClient(ctx)
-	// if err != nil {
-	// 	sendErrorMsg("Failed to setup secret client.", err.Error(), w)
-	// 	return
-	// }
-	// defer secretClient.Close()
-
-	// secretReq := &secretmanagerpb.AccessSecretVersionRequest{
-	// 	Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, "jwt-test"),
-	// }
-	// secretResp, err := secretClient.AccessSecretVersion(ctx, secretReq)
-	// if err != nil {
-	// 	sendErrorMsg("Failed to get jwt secret.", err.Error(), w)
-	// 	return
-	// }
-
-	// w.WriteHeader(http.StatusCreated)
-	// fmt.Fprintln(w, string(secretResp.Payload.Data))
 }
