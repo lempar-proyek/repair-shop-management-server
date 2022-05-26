@@ -36,12 +36,15 @@ type RefreshToken struct {
 	Device     string
 	Os         string
 	ClientName string
+	CreatedAt  time.Time
 }
 
 var kind = "RefreshToken"
 
 func (r *RefreshToken) Create(ctx *context.Context, client *datastore.Client) error {
 	key := datastore.IncompleteKey(kind, nil)
+	r.CreatedAt = time.Now().UTC()
+
 	key, err := client.Put(*ctx, key, r)
 	if err != nil {
 		return err
@@ -57,7 +60,6 @@ func (r *RefreshToken) GetById(ctx *context.Context, client *datastore.Client, i
 }
 
 func (r *RefreshToken) Claims() *RefreshTokenClaims {
-	now := time.Now().UTC()
 	return &RefreshTokenClaims{
 		"refresh_token",
 		jwt.StandardClaims{
@@ -65,7 +67,7 @@ func (r *RefreshToken) Claims() *RefreshTokenClaims {
 			Subject:   strconv.FormatInt(r.UserId, 10),
 			Issuer:    "repair-shop-management-authorizer",
 			Audience:  "repair-shop-management-server",
-			IssuedAt:  now.Unix(),
+			IssuedAt:  r.CreatedAt.Unix(),
 			ExpiresAt: r.ExpiresAt.Unix(),
 		},
 	}

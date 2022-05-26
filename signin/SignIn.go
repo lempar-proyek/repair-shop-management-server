@@ -139,7 +139,7 @@ func getPrivateJwtSecret(ctx *context.Context) ([]byte, error) {
 
 func generateToken(ctx *context.Context, user *User, r *http.Request) (*TokenResponse, error) {
 	refreshExpires := 15768000 // 6 months
-	// now := time.Now().UTC()
+	accessExpires := 10800     // 3 hours
 
 	privateKeyPem, err := getPrivateJwtSecret(ctx)
 	if err != nil {
@@ -160,9 +160,21 @@ func generateToken(ctx *context.Context, user *User, r *http.Request) (*TokenRes
 		return nil, err
 	}
 
+	var accessToken AccessToken
+	err = accessToken.CreateFromUser(ctx, datastoreClient, user, accessExpires)
+	if err != nil {
+		return nil, err
+	}
+
+	accessTokenClaims := accessToken.Claims()
+	signedAccessToken, err := accessTokenClaims.SignRsa256(privateKey)
+	if err != nil {
+		return nil, err
+	}
+
 	var tokenResponse TokenResponse
-	tokenResponse.AccessToken = ""
-	tokenResponse.ExpiresIn = 0
+	tokenResponse.AccessToken = signedAccessToken
+	tokenResponse.ExpiresIn = uint(accessExpires)
 	tokenResponse.Type = "Bearer"
 	tokenResponse.UserData = user.Dto()
 	tokenResponse.RefreshToken = signedRefreshToken
