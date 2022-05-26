@@ -20,7 +20,6 @@ package signin
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -29,29 +28,12 @@ import (
 	"cloud.google.com/go/datastore"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"github.com/golang-jwt/jwt"
-	"github.com/google/uuid"
 	"google.golang.org/api/idtoken"
-	"google.golang.org/api/iterator"
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
 
 var projectID string
 var datastoreClient *datastore.Client
-
-type User struct {
-	Id       *datastore.Key `datastore:"__key__" json:"id"`
-	Name     string         `json:"name"`
-	Username string         `json:"username"`
-	Email    string         `json:"email"`
-	GoogleId string         `json:"-"`
-	Picture  string         `json:"picture"`
-}
-
-type UserDto struct {
-	Name     string `json:"name"`
-	Username string `json:"username"`
-	Picture  string `json:"picture"`
-}
 
 type TokenResponse struct {
 	AccessToken  string   `json:"access_token"`
@@ -59,80 +41,6 @@ type TokenResponse struct {
 	ExpiresIn    uint     `json:"expires_in"`
 	RefreshToken string   `json:"refresh_token"`
 	UserData     *UserDto `json:"user"`
-}
-
-var errNotFound = errors.New("data not found in database")
-var errDuplicateUsername = errors.New("username has been picked by another account")
-var errDuplicateEmail = errors.New("email has been picked by another account")
-var errDuplicateGoogleId = errors.New("google account has been registered by another account")
-
-func (u *User) GetByGID(ctx *context.Context, gid string) error {
-	query := datastore.NewQuery("User").Filter(
-		"GoogleId =",
-		gid,
-	).Limit(1)
-	it := datastoreClient.Run(*ctx, query)
-
-	if _, err := it.Next(u); err == iterator.Done {
-		return errNotFound
-	} else if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (u *User) Create(ctx *context.Context) error {
-	tx, err := datastoreClient.NewTransaction(*ctx, datastore.ReadOnly)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	var users []User
-
-	usernameQuery := datastore.NewQuery("User").Filter("Username =", u.Username).Transaction(tx)
-	_, err = datastoreClient.GetAll(*ctx, usernameQuery, &users)
-	if err != nil {
-		return err
-	}
-	if len(users) > 0 {
-		return errDuplicateUsername
-	}
-
-	emailQuery := datastore.NewQuery("User").Filter("Email =", u.Email).Transaction(tx)
-	_, err = datastoreClient.GetAll(*ctx, emailQuery, &users)
-	if err != nil {
-		return err
-	}
-	if len(users) > 0 {
-		return errDuplicateEmail
-	}
-
-	googleIdQuery := datastore.NewQuery("User").Filter("GoogleId =", u.GoogleId).Transaction(tx)
-	_, err = datastoreClient.GetAll(*ctx, googleIdQuery, &users)
-	if err != nil {
-		return err
-	}
-	if len(users) > 0 {
-		return errDuplicateGoogleId
-	}
-
-	userKey := datastore.IncompleteKey("User", nil)
-	key, err := datastoreClient.Put(*ctx, userKey, u)
-	if err != nil {
-		return err
-	}
-	u.Id = key
-
-	return nil
-}
-
-func (u *User) Dto() *UserDto {
-	return &UserDto{
-		Name:     u.Name,
-		Username: u.Username,
-		Picture:  u.Picture,
-	}
 }
 
 type CredentialsDto struct {
@@ -209,17 +117,6 @@ func validateGoogleToken(ctx *context.Context, token string) (*idtoken.Payload, 
 	}
 
 	return payload, nil
-}
-
-func createNewUserFromGoogleClaims(ctx *context.Context, u *User, claims map[string]interface{}) error {
-	u.Email = fmt.Sprint(claims["email"])
-	u.GoogleId = fmt.Sprint(claims["sub"])
-	u.Name = fmt.Sprint(claims["name"])
-	u.Username = strings.Replace(uuid.New().String(), "-", "", -1)
-	if err := u.Create(ctx); err != nil {
-		return err
-	}
-	return nil
 }
 
 func getPrivateJwtSecret(ctx *context.Context) ([]byte, error) {
@@ -307,8 +204,8 @@ func SignIn(w http.ResponseWriter, r *http.Request) {
 		defer datastoreClient.Close()
 
 		var user User
-		if err := user.GetByGID(&ctx, fmt.Sprint(claims["sub"])); err == errNotFound {
-			err = createNewUserFromGoogleClaims(&ctx, &user, claims)
+		if err := user.GetByGID(&ctx, fmt.Sprint(claims["sub"])); err == datastore.ErrNoSuchEntity {
+			err = user.CreateFromGoogleClaims(&ctx, claims)
 			if err != nil {
 				sendErrorMsg("Error creating user", err.Error(), &w)
 				return
