@@ -25,13 +25,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"cloud.google.com/go/datastore"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"github.com/golang-jwt/jwt"
 	"github.com/google/uuid"
-	ua "github.com/mileusna/useragent"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/iterator"
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
@@ -242,61 +240,36 @@ func getPrivateJwtSecret(ctx *context.Context) ([]byte, error) {
 	return privKeyResp.Payload.Data, nil
 }
 
-func generateToken(ctx *context.Context, user *User, req *http.Request) (TokenResponse, error) {
+func generateToken(ctx *context.Context, user *User, r *http.Request) (*TokenResponse, error) {
 	refreshExpires := 15768000 // 6 months
-	now := time.Now().UTC()
+	// now := time.Now().UTC()
 
-	var tokenResponse TokenResponse
 	privateKeyPem, err := getPrivateJwtSecret(ctx)
 	if err != nil {
-		return tokenResponse, err
+		return nil, err
 	}
 	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyPem)
 	if err != nil {
-		return tokenResponse, err
+		return nil, err
 	}
-
-	userAgent := ua.Parse(req.Header.Get("User-Agent"))
 
 	var refreshToken RefreshToken
-	refreshToken.ClientName = userAgent.Name
-	refreshToken.Device = userAgent.Device
-	refreshToken.Os = userAgent.OS
-
-	refreshToken.ExpiresAt = time.Now().UTC().Add(time.Second * time.Duration(refreshExpires))
-	refreshToken.UserId = user.Id.Name
-	err = refreshToken.Create(ctx, datastoreClient)
+	refreshTokenClaims, err := refreshToken.CreateFromRequest(ctx, user, refreshExpires, r)
 	if err != nil {
-		return tokenResponse, err
+		return nil, err
 	}
-
-	type RefreshClaims struct {
-		Type string `json:"typ,omitempty"`
-		jwt.StandardClaims
-	}
-	refreshClaims := &RefreshClaims{
-		"refresh_token",
-		jwt.StandardClaims{
-			Id:       refreshToken.Id.Name,
-			Subject:  refreshToken.UserId,
-			Issuer:   "repair-shop-management-authorizer",
-			Audience: "repair-shop-management-server",
-			IssuedAt: now.Unix(),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodRS512, refreshClaims)
-	signedRefreshToken, err := token.SignedString(privateKey)
+	signedRefreshToken, err := refreshTokenClaims.SignRsa512(privateKey)
 	if err != nil {
-		return tokenResponse, err
+		return nil, err
 	}
 
+	var tokenResponse TokenResponse
 	tokenResponse.AccessToken = ""
 	tokenResponse.ExpiresIn = 0
 	tokenResponse.Type = "Bearer"
 	tokenResponse.UserData = user.Dto()
 	tokenResponse.RefreshToken = signedRefreshToken
-	return tokenResponse, nil
+	return &tokenResponse, nil
 }
 
 func SignIn(w http.ResponseWriter, r *http.Request) {

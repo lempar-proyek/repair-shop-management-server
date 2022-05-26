@@ -19,14 +19,19 @@ package signin
 
 import (
 	"context"
+	"crypto/rsa"
+	"net/http"
+	"strconv"
 	"time"
 
 	"cloud.google.com/go/datastore"
+	"github.com/golang-jwt/jwt"
+	ua "github.com/mileusna/useragent"
 )
 
 type RefreshToken struct {
 	Id         *datastore.Key `datastore:"__key__"`
-	UserId     string
+	UserId     int64
 	ExpiresAt  time.Time
 	Device     string
 	Os         string
@@ -49,4 +54,49 @@ func (r *RefreshToken) GetById(ctx *context.Context, client *datastore.Client, i
 	key := datastore.NameKey(kind, id, nil)
 	err := client.Get(*ctx, key, r)
 	return err
+}
+
+func (r *RefreshToken) Claims() *RefreshTokenClaims {
+	now := time.Now().UTC()
+	return &RefreshTokenClaims{
+		"refresh_token",
+		jwt.StandardClaims{
+			Id:        strconv.FormatInt(r.Id.ID, 10),
+			Subject:   strconv.FormatInt(r.UserId, 10),
+			Issuer:    "repair-shop-management-authorizer",
+			Audience:  "repair-shop-management-server",
+			IssuedAt:  now.Unix(),
+			ExpiresAt: r.ExpiresAt.Unix(),
+		},
+	}
+}
+
+func (r *RefreshToken) CreateFromRequest(ctx *context.Context, user *User, expires int, req *http.Request) (*RefreshTokenClaims, error) {
+	userAgent := ua.Parse(req.Header.Get("User-Agent"))
+	r.ClientName = userAgent.Name
+	r.Device = userAgent.Device
+	r.Os = userAgent.OS
+
+	r.ExpiresAt = time.Now().UTC().Add(time.Second * time.Duration(expires))
+	r.UserId = user.Id.ID
+	err := r.Create(ctx, datastoreClient)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.Claims(), nil
+}
+
+type RefreshTokenClaims struct {
+	Type string `json:"typ,omitempty"`
+	jwt.StandardClaims
+}
+
+func (rc *RefreshTokenClaims) SignRsa512(key *rsa.PrivateKey) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodRS512, rc)
+	signedRc, err := token.SignedString(key)
+	if err != nil {
+		return "", err
+	}
+	return signedRc, nil
 }
