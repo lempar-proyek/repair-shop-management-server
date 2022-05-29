@@ -15,13 +15,14 @@
 // You should have received a copy of the GNU General Public License
 // along with signin.  If not, see <http://www.gnu.org/licenses/>.
 
-package domains
+package user
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/datastore"
 	"github.com/google/uuid"
@@ -29,15 +30,19 @@ import (
 )
 
 type User struct {
-	Id       *datastore.Key `datastore:"__key__" json:"id"`
-	Name     string         `json:"name"`
-	Username string         `json:"username"`
-	Email    string         `json:"email"`
-	GoogleId string         `json:"-"`
-	Picture  string         `json:"picture"`
+	Id        *datastore.Key `datastore:"__key__" json:"id"`
+	Name      string         `json:"name"`
+	Username  string         `json:"username"`
+	Email     string         `json:"email"`
+	GoogleId  string         `json:"-"`
+	Picture   string         `json:"picture"`
+	Blocked   bool           `json:"-" default:"false"`
+	CreatedAt *time.Time     `json:"created_at"`
+	UpdatedAt *time.Time     `json:"updated_at"`
+	DeletedAt *time.Time     `json:"-"`
 }
 
-var userKind = "User"
+var kind = "User"
 
 func (u *User) GetByGID(ctx *context.Context, gid string, client *datastore.Client) error {
 	query := datastore.NewQuery("User").Filter(
@@ -54,49 +59,50 @@ func (u *User) GetByGID(ctx *context.Context, gid string, client *datastore.Clie
 	return nil
 }
 
-func (u *User) GetById(ctx *context.Context, client *datastore.Client, id string) error {
-	key := datastore.NameKey(userKind, id, nil)
+func (u *User) GetByIdWithTrash(ctx *context.Context, client *datastore.Client, id int64) error {
+	key := datastore.IDKey(kind, id, nil)
 	err := client.Get(*ctx, key, u)
 	return err
 }
 
+func (u *User) GetById(ctx *context.Context, client *datastore.Client, id int64) error {
+	key := datastore.IDKey(kind, id, nil)
+	err := client.Get(*ctx, key, u)
+	if err != nil {
+		return err
+	}
+	if u.DeletedAt != nil {
+		return datastore.ErrNoSuchEntity
+	}
+	return nil
+}
+
 func (u *User) Create(ctx *context.Context, client *datastore.Client) error {
-	tx, err := client.NewTransaction(*ctx, datastore.ReadOnly)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	var ckUser User
 
-	var users []User
-
-	usernameQuery := datastore.NewQuery("User").Filter("Username =", u.Username).Transaction(tx)
-	_, err = client.GetAll(*ctx, usernameQuery, &users)
-	if err != nil {
-		return err
-	}
-	if len(users) > 0 {
+	usernameQuery := datastore.NewQuery(kind).Filter("Username =", u.Username)
+	iter := client.Run(*ctx, usernameQuery)
+	if _, err := iter.Next(&ckUser); err != iterator.Done {
 		return ErrDuplicateUsername
 	}
 
-	emailQuery := datastore.NewQuery("User").Filter("Email =", u.Email).Transaction(tx)
-	_, err = client.GetAll(*ctx, emailQuery, &users)
-	if err != nil {
-		return err
-	}
-	if len(users) > 0 {
+	emailQuery := datastore.NewQuery(kind).Filter("Email =", u.Email)
+	iter = client.Run(*ctx, emailQuery)
+	if _, err := iter.Next(&ckUser); err != iterator.Done {
 		return ErrDuplicateEmail
 	}
 
-	googleIdQuery := datastore.NewQuery("User").Filter("GoogleId =", u.GoogleId).Transaction(tx)
-	_, err = client.GetAll(*ctx, googleIdQuery, &users)
-	if err != nil {
-		return err
-	}
-	if len(users) > 0 {
+	googleIdQuery := datastore.NewQuery(kind).Filter("GoogleId =", u.GoogleId)
+	iter = client.Run(*ctx, googleIdQuery)
+	if _, err := iter.Next(&ckUser); err != iterator.Done {
 		return ErrDuplicateGoogleId
 	}
 
-	userKey := datastore.IncompleteKey("User", nil)
+	now := time.Now().UTC()
+	u.CreatedAt = &now
+	u.UpdatedAt = &now
+
+	userKey := datastore.IncompleteKey(kind, nil)
 	key, err := client.Put(*ctx, userKey, u)
 	if err != nil {
 		return err
@@ -104,14 +110,6 @@ func (u *User) Create(ctx *context.Context, client *datastore.Client) error {
 	u.Id = key
 
 	return nil
-}
-
-func (u *User) Dto() *UserDto {
-	return &UserDto{
-		Name:     u.Name,
-		Username: u.Username,
-		Picture:  u.Picture,
-	}
 }
 
 func (u *User) CreateFromGoogleClaims(ctx *context.Context, client *datastore.Client, claims map[string]interface{}) error {
@@ -123,6 +121,33 @@ func (u *User) CreateFromGoogleClaims(ctx *context.Context, client *datastore.Cl
 		return err
 	}
 	return nil
+}
+
+func (u *User) Update(ctx *context.Context, client *datastore.Client) error {
+	now := time.Now().UTC()
+	u.UpdatedAt = &now
+	_, err := client.Put(*ctx, u.Id, u)
+	return err
+}
+
+func (u *User) SoftDelete(ctx *context.Context, client *datastore.Client) error {
+	now := time.Now().UTC()
+	u.DeletedAt = &now
+	_, err := client.Put(*ctx, u.Id, u)
+	return err
+}
+
+func (u *User) Delete(ctx *context.Context, client *datastore.Client) error {
+	err := client.Delete(*ctx, u.Id)
+	return err
+}
+
+func (u *User) Dto() *UserDto {
+	return &UserDto{
+		Name:     u.Name,
+		Username: u.Username,
+		Picture:  u.Picture,
+	}
 }
 
 type UserDto struct {
